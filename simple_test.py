@@ -11,7 +11,8 @@ from transformers import AutoTokenizer
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(PROJECT_ROOT)
 from model_hub import LlamaModel, QwenModel
-
+from datasets import load_dataset
+dataset = load_dataset('THUDM/LongBench-v2', split='train')
 
 def set_seed(seed):
     random.seed(seed)
