@@ -6,7 +6,7 @@ from retroinfer_kernels import gather_copy_and_concat, gather_copy_and_scatter, 
 from .cache import KV_Cache
 from .kmeans import segment_k_means
 from weighted_flash_decoding import weighted_flash_decoding
-
+import faiss
 
 # update segment size
 THRESHOLD_LENGTH = 1024
@@ -574,14 +574,30 @@ class retroinfer_cache(KV_Cache):
                                self.static_stride, self.list_stride, self.cache_stride,
                                self.execution_stride, self.buffer_size, static_len)
 
+        representative_query = queries.view(self.batch_groups, 1, self.group_size, self.head_dim)[:, :, 0, :].unsqueeze(2)
+        scores = (representative_query * self.execution_buffer_keys).sum(dim=-1).squeeze(-1) # 形状: [batch_groups, execution_stride]
+
+        # 2. 根据有效长度(valid_lengths)掩码掉填充部分的无效分数。
+        seq_len_mask = torch.arange(self.execution_stride, device=queries.device).unsqueeze(0) >= self.valid_lengths.unsqueeze(1)
+        scores.masked_fill_(seq_len_mask, self.DTYPE_MIN)
+
+        # 3. 选出分数最高的 top-128 个Token的索引。
+        k = min(128, self.execution_stride)
+        _, topk_indices = torch.topk(scores, k=k, dim=-1) # 形状: [batch_groups, k]
+
+        # 4. 根据索引(topk_indices)，从执行缓冲区中收集(gather)最终的Top-K个Key和Value。
+        idx_for_gather = topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim)
+        topk_keys = torch.gather(self.execution_buffer_keys, 1, idx_for_gather)
+        topk_values = torch.gather(self.execution_buffer_values, 1, idx_for_gather)
+        topk_valid_lengths = torch.min(self.valid_lengths, torch.tensor(k, device=self.valid_lengths.device))
         # flash attention for retrieve zone and steady zone, merge the estimation zone results at the same time
         attn_out = weighted_flash_decoding(
             queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
-            self.execution_buffer_keys,    # (batch_size*group_num, execution_stride, 1, dim)
-            self.execution_buffer_values,  # (batch_size*group_num, execution_stride, 1, dim)
+            topk_keys,    # (batch_size*group_num, execution_stride, 1, dim)
+            topk_values,  # (batch_size*group_num, execution_stride, 1, dim)
             previous_out=es_out,
             previous_lse=es_lse,
-            cache_seqlens=self.valid_lengths,
+            cache_seqlens=topk_valid_lengths,
             return_softmax_lse=False
         )
 
